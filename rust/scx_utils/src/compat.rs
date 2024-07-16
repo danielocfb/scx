@@ -161,9 +161,9 @@ pub fn is_sched_ext_enabled() -> io::Result<bool> {
 /// a hotplug event occurs between opening and attaching the scheduler.
 #[macro_export]
 macro_rules! scx_ops_open {
-    ($builder: expr, $ops: ident) => {{
+    ($builder: expr, $obj_ref: expr, $ops: ident) => {{
         scx_utils::paste! {
-            let mut skel = $builder.open().context("Failed to open BPF program")?;
+            let mut skel = $builder.open($obj_ref).context("Failed to open BPF program")?;
             let ops = skel.struct_ops.[<$ops _mut>]();
             let has_field = scx_utils::compat::struct_has_field("sched_ext_ops", "hotplug_seq")?;
             if has_field {
@@ -246,8 +246,8 @@ macro_rules! scx_ops_attach {
             .context("Failed to attach non-struct_ops BPF programs")
             .and_then(|_| {
                 $skel
-                    .maps_mut()
-                    .$ops()
+                    .maps
+                    .$ops
                     .attach_struct_ops()
                     .context("Failed to attach struct_ops BPF programs")
             })
