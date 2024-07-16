@@ -3,6 +3,8 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
+use std::mem::MaybeUninit;
+
 use crate::bpf_intf;
 use crate::bpf_skel::*;
 
@@ -11,6 +13,8 @@ use anyhow::Result;
 
 use libbpf_rs::skel::OpenSkel as _;
 use libbpf_rs::skel::SkelBuilder as _;
+use libbpf_rs::MapCore;
+use libbpf_rs::OpenObject;
 
 use libc::{sched_param, sched_setscheduler};
 
@@ -180,6 +184,7 @@ const LIBBPF_STOP: i32 = -255;
 
 impl<'cb> BpfScheduler<'cb> {
     pub fn init(
+        open_object: &'cb mut MaybeUninit<OpenObject>,
         slice_us: u64,
         nr_cpus_online: i32,
         partial: bool,
@@ -190,7 +195,7 @@ impl<'cb> BpfScheduler<'cb> {
         // Open the BPF prog first for verification.
         let skel_builder = BpfSkelBuilder::default();
         init_libbpf_logging(None);
-        let mut skel = skel_builder.open().context("Failed to open BPF program")?;
+        let mut skel = skel_builder.open(open_object).context("Failed to open BPF program")?;
 
         // Lock all the memory to prevent page faults that could trigger potential deadlocks during
         // scheduling.
@@ -235,7 +240,7 @@ impl<'cb> BpfScheduler<'cb> {
         //
         // NOTE: we should probably refresh this counter during the normal execution to support cpu
         // hotplugging, but for now let's keep it simple and set this only at initialization).
-        skel.rodata_mut().num_possible_cpus = nr_cpus_online;
+        skel.maps.rodata_data.num_possible_cpus = nr_cpus_online;
 
         // Set scheduler options (defined in the BPF part).
         if partial {
@@ -243,19 +248,18 @@ impl<'cb> BpfScheduler<'cb> {
         }
 	skel.struct_ops.rustland_mut().exit_dump_len = exit_dump_len;
 
-        skel.bss_mut().usersched_pid = std::process::id();
-        skel.rodata_mut().slice_ns = slice_us * 1000;
-        skel.rodata_mut().switch_partial = partial;
-        skel.rodata_mut().debug = debug;
-        skel.rodata_mut().full_user = full_user;
+        skel.maps.bss_data.usersched_pid = std::process::id();
+        skel.maps.rodata_data.slice_ns = slice_us * 1000;
+        skel.maps.rodata_data.switch_partial = partial;
+        skel.maps.rodata_data.debug = debug;
+        skel.maps.rodata_data.full_user = full_user;
 
         // Attach BPF scheduler.
         let mut skel = scx_ops_load!(skel, rustland, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, rustland)?);
 
         // Build the ring buffer of queued tasks.
-        let binding = skel.maps();
-        let queued_ring_buffer = binding.queued();
+        let queued_ring_buffer = &skel.maps.queued;
         let mut rbb = libbpf_rs::RingBufferBuilder::new();
         rbb.add(queued_ring_buffer, callback)
             .expect("failed to add ringbuf callback");
@@ -285,77 +289,77 @@ impl<'cb> BpfScheduler<'cb> {
     // busy loop, causing unnecessary high CPU consumption.
     pub fn update_tasks(&mut self, nr_queued: Option<u64>, nr_scheduled: Option<u64>) {
         if let Some(queued) = nr_queued {
-            self.skel.bss_mut().nr_queued = queued;
+            self.skel.maps.bss_data.nr_queued = queued;
         }
         if let Some(scheduled) = nr_scheduled {
-            self.skel.bss_mut().nr_scheduled = scheduled;
+            self.skel.maps.bss_data.nr_scheduled = scheduled;
         }
     }
 
     // Override the default scheduler time slice (in us).
     #[allow(dead_code)]
     pub fn set_effective_slice_us(&mut self, slice_us: u64) {
-        self.skel.bss_mut().effective_slice_ns = slice_us * 1000;
+        self.skel.maps.bss_data.effective_slice_ns = slice_us * 1000;
     }
 
     // Get current value of time slice (slice_ns).
     #[allow(dead_code)]
     pub fn get_effective_slice_us(&mut self) -> u64 {
-        let slice_ns = self.skel.bss().effective_slice_ns;
+        let slice_ns = self.skel.maps.bss_data.effective_slice_ns;
 
         if slice_ns > 0 {
             slice_ns / 1000
         } else {
-            self.skel.rodata().slice_ns / 1000
+            self.skel.maps.rodata_data.slice_ns / 1000
         }
     }
 
     // Counter of queued tasks.
     #[allow(dead_code)]
     pub fn nr_queued_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_queued
+        &mut self.skel.maps.bss_data.nr_queued
     }
 
     // Counter of scheduled tasks.
     #[allow(dead_code)]
     pub fn nr_scheduled_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_scheduled
+        &mut self.skel.maps.bss_data.nr_scheduled
     }
 
     // Counter of user dispatch events.
     #[allow(dead_code)]
     pub fn nr_user_dispatches_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_user_dispatches
+        &mut self.skel.maps.bss_data.nr_user_dispatches
     }
 
     // Counter of user kernel events.
     #[allow(dead_code)]
     pub fn nr_kernel_dispatches_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_kernel_dispatches
+        &mut self.skel.maps.bss_data.nr_kernel_dispatches
     }
 
     // Counter of cancel dispatch events.
     #[allow(dead_code)]
     pub fn nr_cancel_dispatches_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_cancel_dispatches
+        &mut self.skel.maps.bss_data.nr_cancel_dispatches
     }
 
     // Counter of dispatches bounced to the shared DSQ.
     #[allow(dead_code)]
     pub fn nr_bounce_dispatches_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_bounce_dispatches
+        &mut self.skel.maps.bss_data.nr_bounce_dispatches
     }
 
     // Counter of failed dispatch events.
     #[allow(dead_code)]
     pub fn nr_failed_dispatches_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_failed_dispatches
+        &mut self.skel.maps.bss_data.nr_failed_dispatches
     }
 
     // Counter of scheduler congestion events.
     #[allow(dead_code)]
     pub fn nr_sched_congested_mut(&mut self) -> &mut u64 {
-        &mut self.skel.bss_mut().nr_sched_congested
+        &mut self.skel.maps.bss_data.nr_sched_congested
     }
 
     // Set scheduling class for the scheduler itself to SCHED_EXT
@@ -370,7 +374,7 @@ impl<'cb> BpfScheduler<'cb> {
     // Get the pid running on a certain CPU, if no tasks are running return 0.
     #[allow(dead_code)]
     pub fn get_cpu_pid(&self, cpu: i32) -> u32 {
-        let cpu_map_ptr = self.skel.bss().cpu_map.as_ptr();
+        let cpu_map_ptr = self.skel.maps.bss_data.cpu_map.as_ptr();
 
         unsafe { *cpu_map_ptr.offset(cpu as isize) }
     }
@@ -393,8 +397,8 @@ impl<'cb> BpfScheduler<'cb> {
 
     // Send a task to the dispatcher.
     pub fn dispatch_task(&mut self, task: &DispatchedTask) -> Result<(), libbpf_rs::Error> {
-        let maps = self.skel.maps();
-        let dispatched = maps.dispatched();
+        let maps = &self.skel.maps;
+        let dispatched = &maps.dispatched;
         let msg = DispatchedMessage::from_dispatched_task(&task);
 
         dispatched.update(&[], msg.as_bytes(), libbpf_rs::MapFlags::ANY)

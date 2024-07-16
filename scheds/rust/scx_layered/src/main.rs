@@ -12,6 +12,7 @@ use std::ffi::CString;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
+use std::mem::MaybeUninit;
 use std::ops::Sub;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
@@ -30,6 +31,8 @@ use bitvec::prelude::*;
 use clap::Parser;
 use libbpf_rs::skel::OpenSkel as _;
 use libbpf_rs::skel::SkelBuilder as _;
+use libbpf_rs::MapCore as _;
+use libbpf_rs::OpenObject;
 use log::debug;
 use log::info;
 use log::trace;
@@ -459,8 +462,8 @@ fn format_bitvec(bitvec: &BitVec) -> String {
 fn read_cpu_ctxs(skel: &BpfSkel) -> Result<Vec<bpf_intf::cpu_ctx>> {
     let mut cpu_ctxs = vec![];
     let cpu_ctxs_vec = skel
-        .maps()
-        .cpu_ctxs()
+        .maps
+        .cpu_ctxs
         .lookup_percpu(&0u32.to_ne_bytes(), libbpf_rs::MapFlags::ANY)
         .context("Failed to lookup cpu_ctx")?
         .unwrap();
@@ -552,7 +555,7 @@ impl Stats {
     fn read_layer_loads(skel: &mut BpfSkel, nr_layers: usize) -> (f64, Vec<f64>) {
         let now_mono = now_monotonic();
         let layer_loads: Vec<f64> = skel
-            .bss()
+            .maps.bss_data
             .layers
             .iter()
             .take(nr_layers)
@@ -585,7 +588,7 @@ impl Stats {
     }
 
     fn new(skel: &mut BpfSkel, proc_reader: &procfs::ProcReader) -> Result<Self> {
-        let nr_layers = skel.rodata().nr_layers as usize;
+        let nr_layers = skel.maps.rodata_data.nr_layers as usize;
         let bpf_stats = BpfStats::read(&read_cpu_ctxs(skel)?, nr_layers);
 
         Ok(Self {
@@ -619,7 +622,7 @@ impl Stats {
         let cpu_ctxs = read_cpu_ctxs(skel)?;
 
         let nr_layer_tasks: Vec<usize> = skel
-            .bss()
+            .maps.bss_data
             .layers
             .iter()
             .take(self.nr_layers)
@@ -1237,10 +1240,10 @@ struct Scheduler<'a> {
 
 impl<'a> Scheduler<'a> {
     fn init_layers(skel: &mut OpenBpfSkel, specs: &Vec<LayerSpec>) -> Result<()> {
-        skel.rodata_mut().nr_layers = specs.len() as u32;
+        skel.maps.rodata_data.nr_layers = specs.len() as u32;
 
         for (spec_i, spec) in specs.iter().enumerate() {
-            let layer = &mut skel.bss_mut().layers[spec_i];
+            let layer = &mut skel.maps.bss_data.layers[spec_i];
 
             for (or_i, or) in spec.matches.iter().enumerate() {
                 for (and_i, and) in or.iter().enumerate() {
@@ -1298,7 +1301,7 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
-    fn init(opts: &Opts, layer_specs: Vec<LayerSpec>) -> Result<Self> {
+    fn init(opts: &Opts, layer_specs: Vec<LayerSpec>, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         let nr_layers = layer_specs.len();
         let mut cpu_pool = CpuPool::new()?;
 
@@ -1306,20 +1309,20 @@ impl<'a> Scheduler<'a> {
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose > 1);
         init_libbpf_logging(None);
-        let mut skel = skel_builder.open().context("Failed to open BPF program")?;
+        let mut skel = skel_builder.open(open_object).context("Failed to open BPF program")?;
 
         // Initialize skel according to @opts.
         skel.struct_ops.layered_mut().exit_dump_len = opts.exit_dump_len;
 
-        skel.rodata_mut().debug = opts.verbose as u32;
-        skel.rodata_mut().slice_ns = opts.slice_us * 1000;
-        skel.rodata_mut().nr_possible_cpus = *NR_POSSIBLE_CPUS as u32;
-        skel.rodata_mut().smt_enabled = cpu_pool.nr_cpus > cpu_pool.nr_cores;
+        skel.maps.rodata_data.debug = opts.verbose as u32;
+        skel.maps.rodata_data.slice_ns = opts.slice_us * 1000;
+        skel.maps.rodata_data.nr_possible_cpus = *NR_POSSIBLE_CPUS as u32;
+        skel.maps.rodata_data.smt_enabled = cpu_pool.nr_cpus > cpu_pool.nr_cores;
         for (cpu, sib) in cpu_pool.sibling_cpu.iter().enumerate() {
-            skel.rodata_mut().__sibling_cpu[cpu] = *sib;
+            skel.maps.rodata_data.__sibling_cpu[cpu] = *sib;
         }
         for cpu in cpu_pool.all_cpus.iter_ones() {
-            skel.rodata_mut().all_cpus[cpu / 8] |= 1 << (cpu % 8);
+            skel.maps.rodata_data.all_cpus[cpu / 8] |= 1 << (cpu % 8);
         }
         Self::init_layers(&mut skel, &layer_specs)?;
 
@@ -1371,7 +1374,7 @@ impl<'a> Scheduler<'a> {
         Ok(sched)
     }
 
-    fn update_bpf_layer_cpumask(layer: &Layer, bpf_layer: &mut bpf_types::layer) {
+    fn update_bpf_layer_cpumask(layer: &Layer, bpf_layer: &mut types::layer) {
         for bit in 0..layer.cpus.len() {
             if layer.cpus[bit] {
                 bpf_layer.cpus[bit / 8] |= 1 << (bit % 8);
@@ -1416,7 +1419,7 @@ impl<'a> Scheduler<'a> {
                     {
                         Self::update_bpf_layer_cpumask(
                             &self.layers[idx],
-                            &mut self.skel.bss_mut().layers[idx],
+                            &mut self.skel.maps.bss_data.layers[idx],
                         );
                         updated = true;
                     }
@@ -1430,7 +1433,7 @@ impl<'a> Scheduler<'a> {
             let nr_available_cpus = available_cpus.count_ones();
             for idx in 0..self.layers.len() {
                 let layer = &mut self.layers[idx];
-                let bpf_layer = &mut self.skel.bss_mut().layers[idx];
+                let bpf_layer = &mut self.skel.maps.bss_data.layers[idx];
                 match &layer.kind {
                     LayerKind::Open { .. } => {
                         layer.cpus.copy_from_bitslice(&available_cpus);
@@ -1441,7 +1444,7 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
-            self.skel.bss_mut().fallback_cpu = self.cpu_pool.fallback_cpu as u32;
+            self.skel.maps.bss_data.fallback_cpu = self.cpu_pool.fallback_cpu as u32;
 
             for (lidx, layer) in self.layers.iter().enumerate() {
                 self.nr_layer_cpus_min_max[lidx] = (
@@ -1923,7 +1926,8 @@ fn main() -> Result<()> {
     debug!("specs={}", serde_json::to_string_pretty(&layer_config)?);
     verify_layer_specs(&layer_config.specs)?;
 
-    let mut sched = Scheduler::init(&opts, layer_config.specs)?;
+    let mut open_object = MaybeUninit::uninit();
+    let mut sched = Scheduler::init(&opts, layer_config.specs, &mut open_object)?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();

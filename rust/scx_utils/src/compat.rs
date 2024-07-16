@@ -157,8 +157,8 @@ macro_rules! scx_ops_load {
 macro_rules! scx_ops_attach {
     ($skel: expr, $ops: ident) => {{
         $skel
-            .maps_mut()
-            .$ops()
+            .maps
+            .$ops
             .attach_struct_ops()
             .context("Failed to attach struct ops")
     }};

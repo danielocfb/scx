@@ -11,6 +11,9 @@ use bpf::*;
 
 use scx_utils::Topology;
 
+use libbpf_rs::OpenObject;
+
+use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -24,9 +27,9 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
-    fn init() -> Result<Self> {
+    fn init(open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         let topo = Topology::new().expect("Failed to build host topology");
-        let bpf = BpfScheduler::init(5000, topo.nr_cpus_possible() as i32, false, 0, false, false)?;
+        let bpf = BpfScheduler::init(open_object, 5000, topo.nr_cpus_possible() as i32, false, 0, false, false)?;
         Ok(Self { bpf })
     }
 
@@ -121,7 +124,8 @@ please open a GitHub issue.
 }
 
 fn main() -> Result<()> {
-    let mut sched = Scheduler::init()?;
+    let mut open_object = MaybeUninit::uninit();
+    let mut sched = Scheduler::init(&mut open_object)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
 
