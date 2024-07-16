@@ -17,7 +17,7 @@ use std::thread;
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-
+use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use libbpf_rs::OpenObject;
 use log::info;
 use log::warn;
 
@@ -270,7 +271,10 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
-    fn init(opts: &Opts) -> Result<Self> {
+    fn init(
+        opts: &Opts,
+        open_object: &'a mut MaybeUninit<OpenObject>,
+    ) -> Result<Self> {
         // Initialize core mapping topology.
         let topo = Topology::new().expect("Failed to build host topology");
         let topo_map = TopologyMap::new(&topo).expect("Failed to generate topology map");
@@ -303,6 +307,7 @@ impl<'a> Scheduler<'a> {
         // Low-level BPF connector.
         let nr_cpus = topo.nr_cpu_ids();
         let bpf = BpfScheduler::init(
+            open_object,
             opts.slice_us,
             nr_cpus as i32,
             opts.partial,
@@ -818,8 +823,9 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
+    let mut open_object = MaybeUninit::uninit();
     loop {
-        let mut sched = Scheduler::init(&opts)?;
+        let mut sched = Scheduler::init(&opts, &mut open_object)?;
         // Start the scheduler.
         if !sched.run(shutdown.clone())?.should_restart() {
             break;
