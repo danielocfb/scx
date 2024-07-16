@@ -12,6 +12,10 @@ use bpf::*;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 
+use libbpf_rs::Object;
+use libbpf_rs::OpenObject;
+
+use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -25,9 +29,14 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
-    fn init() -> Result<Self> {
+    fn init(
+        open_object: &'a mut MaybeUninit<OpenObject>,
+        object: &'a mut MaybeUninit<Object>,
+    ) -> Result<Self> {
         let topo = Topology::new().expect("Failed to build host topology");
         let bpf = BpfScheduler::init(
+            open_object,
+            object,
             5000,                     // slice_ns (default task time slice)
             topo.nr_cpu_ids() as i32, // nr_cpus (max CPUs available in the system)
             false,                    // partial (include all tasks if disabled)
@@ -144,8 +153,10 @@ fn main() -> Result<()> {
         shutdown_clone.store(true, Ordering::Relaxed);
     })?;
 
+    let mut open_object = MaybeUninit::uninit();
+    let mut object = MaybeUninit::uninit();
     loop {
-        let mut sched = Scheduler::init()?;
+        let mut sched = Scheduler::init(&mut open_object, &mut object)?;
         if !sched.run(shutdown.clone())?.should_restart() {
             break;
         }

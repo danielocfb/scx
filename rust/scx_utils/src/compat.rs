@@ -177,11 +177,11 @@ pub fn check_min_requirements() -> Result<()> {
 #[rustfmt::skip]
 #[macro_export]
 macro_rules! scx_ops_open {
-    ($builder: expr, $ops: ident) => { 'block: {
+    ($builder: expr, $obj_ref: expr, $ops: ident) => { 'block: {
         scx_utils::paste! {
 	    scx_utils::unwrap_or_break!(scx_utils::compat::check_min_requirements(), 'block);
 
-            let mut skel = match $builder.open().context("Failed to open BPF program") {
+            let mut skel = match $builder.open($obj_ref).context("Failed to open BPF program") {
                 Ok(val) => val,
                 Err(e) => break 'block Err(e),
             };
@@ -216,10 +216,10 @@ macro_rules! scx_ops_open {
 #[rustfmt::skip]
 #[macro_export]
 macro_rules! scx_ops_load {
-    ($skel: expr, $ops: ident, $uei: ident) => { 'block: {
+    ($skel: expr, $obj_ref: expr, $ops: ident, $uei: ident) => { 'block: {
         scx_utils::paste! {
             scx_utils::uei_set_size!($skel, $ops, $uei);
-            $skel.load().context("Failed to load BPF program")
+            $skel.load($obj_ref).context("Failed to load BPF program")
         }
     }};
 }
@@ -239,8 +239,8 @@ macro_rules! scx_ops_attach {
             .context("Failed to attach non-struct_ops BPF programs")
             .and_then(|_| {
                 $skel
-                    .maps_mut()
-                    .$ops()
+                    .maps
+                    .$ops
                     .attach_struct_ops()
                     .context("Failed to attach struct_ops BPF programs")
             })

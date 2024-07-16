@@ -15,7 +15,7 @@ ctrlc = { version = "3.1", features = ["termination"] }
 fb_procfs = "0.7"
 itertools = "0.12.1"
 lazy_static = "1.4"
-libbpf-rs = "0.23"
+libbpf-rs = { git = "https://github.com/libbpf/libbpf-rs", rev = "df6089e8bea25ce94ecfd43b2b809d0d5d416bcd", version = "0.23" }
 libc = "0.2"
 log = "0.4"
 maplit = "1.0.2"

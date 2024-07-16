@@ -16,8 +16,8 @@ bindgen = ">=0.68, <0.70"
 glob = "0.3"
 hex = "0.4.3"
 lazy_static = "1.4"
-libbpf-cargo = "0.23"
-libbpf-rs = "0.23"
+libbpf-cargo = { git = "https://github.com/libbpf/libbpf-rs", rev = "df6089e8bea25ce94ecfd43b2b809d0d5d416bcd", version = "0.23" }
+libbpf-rs = { git = "https://github.com/libbpf/libbpf-rs", rev = "df6089e8bea25ce94ecfd43b2b809d0d5d416bcd", version = "0.23" }
 log = "0.4"
 paste = "1.0"
 regex = "1.10"

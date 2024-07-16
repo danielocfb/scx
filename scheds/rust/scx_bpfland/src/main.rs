@@ -12,6 +12,7 @@ pub use bpf_intf::*;
 
 use std::fs::File;
 use std::io::Read;
+use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -30,6 +31,8 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 
 use rlimit::{getrlimit, setrlimit, Resource};
 
+use libbpf_rs::Object;
+use libbpf_rs::OpenObject;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
@@ -159,7 +162,7 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
-    fn init(opts: &'a Opts) -> Result<Self> {
+    fn init(opts: &'a Opts, open_object: &'a mut MaybeUninit<OpenObject>, object: &'a mut MaybeUninit<Object>) -> Result<Self> {
         let (soft_limit, _) = getrlimit(Resource::MEMLOCK).unwrap();
         setrlimit(Resource::MEMLOCK, soft_limit, rlimit::INFINITY).unwrap();
 
@@ -181,22 +184,22 @@ impl<'a> Scheduler<'a> {
         // Initialize BPF connector.
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
-        let mut skel = scx_ops_open!(skel_builder, bpfland_ops)?;
+        let mut skel = scx_ops_open!(skel_builder, open_object, bpfland_ops)?;
 
         skel.struct_ops.bpfland_ops_mut().exit_dump_len = opts.exit_dump_len;
 
         // Override default BPF scheduling parameters.
-        skel.rodata_mut().debug = opts.debug;
-        skel.rodata_mut().smt_enabled = smt_enabled;
-        skel.rodata_mut().local_kthreads = opts.local_kthreads;
-        skel.rodata_mut().slice_ns = opts.slice_us * 1000;
-        skel.rodata_mut().slice_ns_min = opts.slice_us_min * 1000;
-        skel.rodata_mut().slice_ns_lag = opts.slice_us_lag * 1000;
-        skel.rodata_mut().starvation_thresh_ns = opts.starvation_thresh_us * 1000;
-        skel.rodata_mut().nvcsw_thresh = opts.nvcsw_thresh;
+        skel.maps.rodata_data.debug = opts.debug;
+        skel.maps.rodata_data.smt_enabled = smt_enabled;
+        skel.maps.rodata_data.local_kthreads = opts.local_kthreads;
+        skel.maps.rodata_data.slice_ns = opts.slice_us * 1000;
+        skel.maps.rodata_data.slice_ns_min = opts.slice_us_min * 1000;
+        skel.maps.rodata_data.slice_ns_lag = opts.slice_us_lag * 1000;
+        skel.maps.rodata_data.starvation_thresh_ns = opts.starvation_thresh_us * 1000;
+        skel.maps.rodata_data.nvcsw_thresh = opts.nvcsw_thresh;
 
         // Attach the scheduler.
-        let mut skel = scx_ops_load!(skel, bpfland_ops, uei)?;
+        let mut skel = scx_ops_load!(skel, object, bpfland_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, bpfland_ops)?);
 
         // Enable Prometheus metrics.
@@ -215,13 +218,13 @@ impl<'a> Scheduler<'a> {
     }
 
     fn update_stats(&mut self) {
-        let nr_cpus = self.skel.bss().nr_online_cpus;
-        let nr_running = self.skel.bss().nr_running;
-        let nr_interactive = self.skel.bss().nr_interactive;
-        let nr_kthread_dispatches = self.skel.bss().nr_kthread_dispatches;
-        let nr_direct_dispatches = self.skel.bss().nr_direct_dispatches;
-        let nr_prio_dispatches = self.skel.bss().nr_prio_dispatches;
-        let nr_shared_dispatches = self.skel.bss().nr_shared_dispatches;
+        let nr_cpus = self.skel.maps.bss_data.nr_online_cpus;
+        let nr_running = self.skel.maps.bss_data.nr_running;
+        let nr_interactive = self.skel.maps.bss_data.nr_interactive;
+        let nr_kthread_dispatches = self.skel.maps.bss_data.nr_kthread_dispatches;
+        let nr_direct_dispatches = self.skel.maps.bss_data.nr_direct_dispatches;
+        let nr_prio_dispatches = self.skel.maps.bss_data.nr_prio_dispatches;
+        let nr_shared_dispatches = self.skel.maps.bss_data.nr_shared_dispatches;
 
         // Update Prometheus statistics.
         self.metrics
@@ -305,8 +308,10 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
+    let mut open_object = MaybeUninit::uninit();
+    let mut object = MaybeUninit::uninit();
     loop {
-        let mut sched = Scheduler::init(&opts)?;
+        let mut sched = Scheduler::init(&opts, &mut open_object, &mut object)?;
         if !sched.run(shutdown.clone())?.should_restart() {
             break;
         }

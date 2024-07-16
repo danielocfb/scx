@@ -12,6 +12,7 @@ pub mod bpf_intf;
 pub use bpf_intf::*;
 
 use std::mem;
+use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -26,6 +27,8 @@ use clap::Parser;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::Object;
+use libbpf_rs::OpenObject;
 use log::info;
 use scx_utils::build_id;
 use scx_utils::scx_ops_attach;
@@ -114,7 +117,11 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
-    fn init(opts: &'a Opts) -> Result<Self> {
+    fn init(
+        opts: &'a Opts,
+        open_object: &'a mut MaybeUninit<OpenObject>,
+        object: &'a mut MaybeUninit<Object>,
+    ) -> Result<Self> {
         // Increase MEMLOCK size since the BPF scheduler might use
         // more than the current limit
         let (soft_limit, _) = getrlimit(Resource::MEMLOCK).unwrap();
@@ -123,7 +130,7 @@ impl<'a> Scheduler<'a> {
         // Open the BPF prog first for verification.
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose > 0);
-        let mut skel = scx_ops_open!(skel_builder, lavd_ops)?;
+        let mut skel = scx_ops_open!(skel_builder, open_object, lavd_ops)?;
 
         // Initialize CPU order topologically sorted by cpu, core, LLC, and NUMA.
         let topo = Topology::new().expect("Failed to build host topology");
@@ -131,7 +138,7 @@ impl<'a> Scheduler<'a> {
             for llc in node.llcs().values() {
                 for core in llc.cores().values() {
                     for (cpu_id, cpu) in core.cpus().iter() {
-                        skel.rodata_mut().cpu_order[*cpu_id] = cpu.id() as u16;
+                        skel.maps.rodata_data.cpu_order[*cpu_id] = cpu.id() as u16;
                     }
                 }
             }
@@ -139,20 +146,19 @@ impl<'a> Scheduler<'a> {
 
         // Initialize skel according to @opts.
         let nr_cpus_onln = topo.span().weight() as u64;
-        skel.bss_mut().nr_cpus_onln = nr_cpus_onln;
+        skel.maps.bss_data.nr_cpus_onln = nr_cpus_onln;
         skel.struct_ops.lavd_ops_mut().exit_dump_len = opts.exit_dump_len;
-        skel.rodata_mut().no_core_compaction = opts.no_core_compaction;
-        skel.rodata_mut().no_freq_scaling = opts.no_freq_scaling;
-        skel.rodata_mut().verbose = opts.verbose;
+        skel.maps.rodata_data.no_core_compaction = opts.no_core_compaction;
+        skel.maps.rodata_data.no_freq_scaling = opts.no_freq_scaling;
+        skel.maps.rodata_data.verbose = opts.verbose;
         let intrspc = introspec::init(opts);
 
         // Attach.
-        let mut skel = scx_ops_load!(skel, lavd_ops, uei)?;
+        let mut skel = scx_ops_load!(skel, object, lavd_ops, uei)?;
         let struct_ops = Some(scx_ops_attach!(skel, lavd_ops)?);
 
         // Build a ring buffer for instrumentation
-        let mut maps = skel.maps_mut();
-        let rb_map = maps.introspec_msg();
+        let rb_map = &mut skel.maps.introspec_msg;
         let mut builder = libbpf_rs::RingBufferBuilder::new();
         builder.add(rb_map, Scheduler::print_bpf_msg).unwrap();
         let rb_mgr = builder.build().unwrap();
@@ -276,9 +282,9 @@ impl<'a> Scheduler<'a> {
         }
         self.intrspc.requested = true as u8;
 
-        self.skel.bss_mut().intrspc.cmd = self.intrspc.cmd;
-        self.skel.bss_mut().intrspc.arg = self.intrspc.arg;
-        self.skel.bss_mut().intrspc.requested = self.intrspc.requested;
+        self.skel.maps.bss_data.intrspc.cmd = self.intrspc.cmd;
+        self.skel.maps.bss_data.intrspc.arg = self.intrspc.arg;
+        self.skel.maps.bss_data.intrspc.requested = self.intrspc.requested;
 
         interval_ms
     }
@@ -363,8 +369,11 @@ fn main() -> Result<()> {
     init_log(&opts);
     init_signal_handlers();
 
+    let mut open_object = MaybeUninit::uninit();
+    let mut object = MaybeUninit::uninit();
+
     loop {
-	let mut sched = Scheduler::init(&opts)?;
+	let mut sched = Scheduler::init(&opts, &mut open_object, &mut object)?;
 	info!("scx_lavd scheduler is initialized (build ID: {})", *build_id::SCX_FULL_VERSION);
 	info!("    Note that scx_lavd currently is not optimized for multi-CCX/NUMA architectures.");
 	info!("    Stay tuned for future improvements!");
