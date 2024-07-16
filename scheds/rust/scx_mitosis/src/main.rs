@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fs::File;
+use std::mem::MaybeUninit;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -27,6 +28,8 @@ use itertools::Itertools;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
+use libbpf_rs::MapCore as _;
+use libbpf_rs::OpenObject;
 use log::debug;
 use log::info;
 use log::trace;
@@ -262,13 +265,13 @@ struct Scheduler<'a> {
 }
 
 impl<'a> Scheduler<'a> {
-    fn init(opts: &Opts) -> Result<Self> {
+    fn init(opts: &Opts, open_object: &'a mut MaybeUninit<OpenObject>) -> Result<Self> {
         let mut cpu_pool = CpuPool::new()?;
 
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose > 1);
         init_libbpf_logging(None);
-        let mut skel = scx_ops_open!(skel_builder, mitosis)?;
+        let mut skel = scx_ops_open!(skel_builder, open_object, mitosis)?;
 
         // scheduler_tick() got renamed to sched_tick() during v6.10-rc.
         let sched_tick_name = match compat::ksym_exists("sched_tick")? {
@@ -276,20 +279,20 @@ impl<'a> Scheduler<'a> {
             false => "scheduler_tick",
         };
 
-        skel.progs_mut()
-            .sched_tick_fentry()
+        skel.progs
+            .sched_tick_fentry
             .set_attach_target(0, Some(sched_tick_name.into()))
             .context("Failed to set attach target for sched_tick_fentry()")?;
 
         skel.struct_ops.mitosis_mut().exit_dump_len = opts.exit_dump_len;
 
         if opts.verbose >= 1 {
-            skel.rodata_mut().debug = true;
+            skel.maps.rodata_data.debug = true;
         }
-        skel.rodata_mut().nr_possible_cpus = *NR_POSSIBLE_CPUS as u32;
+        skel.maps.rodata_data.nr_possible_cpus = *NR_POSSIBLE_CPUS as u32;
         for cpu in cpu_pool.all_cpus.iter_ones() {
-            skel.rodata_mut().all_cpus[cpu / 8] |= 1 << (cpu % 8);
-            skel.bss_mut().cells[0].cpus[cpu / 8] |= 1 << (cpu % 8);
+            skel.maps.rodata_data.all_cpus[cpu / 8] |= 1 << (cpu % 8);
+            skel.maps.bss_data.cells[0].cpus[cpu / 8] |= 1 << (cpu % 8);
         }
         for _ in 0..cpu_pool.all_cpus.count_ones() {
             cpu_pool.alloc();
@@ -345,7 +348,7 @@ impl<'a> Scheduler<'a> {
             let total_load = self.collect_cgroup_load()?;
             self.debug()?;
             let mut reconfigured = false;
-            if self.skel.bss().user_global_seq != self.skel.bss().global_seq {
+            if self.skel.maps.bss_data.user_global_seq != self.skel.maps.bss_data.global_seq {
                 trace!("BPF reconfiguration still in progress, skipping further changes");
             } else if self.last_reconfiguration.elapsed() >= self.reconfiguration_interval {
                 trace!("Reconfiguring");
@@ -387,21 +390,21 @@ impl<'a> Scheduler<'a> {
             let cell_idx_slice = unsafe { any_as_u8_slice(&cell_idx_u32) };
             /* XXX: NO_EXIST should be correct here, but it fails */
             self.skel
-                .maps()
-                .cgrp_cell_assignment()
+                .maps
+                .cgrp_cell_assignment
                 .update(cg_fd_slice, cell_idx_slice, libbpf_rs::MapFlags::ANY)
                 .with_context(|| {
                     format!("Failed to update cgroup cell assignment for: {}", cg_path)
                 })?;
             trace!("Assigned {} to {}", cgroup, cell_idx);
         }
-        self.skel.bss_mut().update_cell_assignment = true;
+        self.skel.maps.bss_data.update_cell_assignment = true;
         Ok(())
     }
 
     fn trigger_reconfiguration(&mut self) {
         trace!("Triggering Reconfiguration");
-        self.skel.bss_mut().user_global_seq += 1;
+        self.skel.maps.bss_data.user_global_seq += 1;
     }
 
     /// Iterate through each cg in the cgroupfs, read its load from BPF and
@@ -433,8 +436,8 @@ impl<'a> Scheduler<'a> {
             let cg_fd_slice = unsafe { any_as_u8_slice(&cg_fd) };
             if let Some(v) = self
                 .skel
-                .maps()
-                .cgrp_ctx()
+                .maps
+                .cgrp_ctx
                 .lookup(cg_fd_slice, libbpf_rs::MapFlags::ANY)
                 .with_context(|| {
                     format!(
@@ -528,8 +531,8 @@ impl<'a> Scheduler<'a> {
         let zero_slice = unsafe { any_as_u8_slice(&zero) };
         if let Some(v) = self
             .skel
-            .maps()
-            .cpu_ctxs()
+            .maps
+            .cpu_ctxs
             .lookup_percpu(zero_slice, libbpf_rs::MapFlags::ANY)
             .context("Failed to lookup cpu_ctxs map")?
         {
@@ -638,7 +641,7 @@ impl<'a> Scheduler<'a> {
                     .free(&mut cell.cpu_assignment)
                     .ok_or(anyhow!("No cpus to free"))?;
                 trace!("Freeing {} from Cell {}", freed_cpu, cell_idx);
-                self.skel.bss_mut().cells[*cell_idx as usize].cpus[freed_cpu / 8] &=
+                self.skel.maps.bss_data.cells[*cell_idx as usize].cpus[freed_cpu / 8] &=
                     !(1 << freed_cpu % 8);
             }
         }
@@ -655,10 +658,10 @@ impl<'a> Scheduler<'a> {
                     .ok_or(anyhow!("No cpus to allocate"))?;
                 trace!("Allocating {} to Cell {}", new_cpu, cell_idx);
                 cell.cpu_assignment.set(new_cpu, true);
-                self.skel.bss_mut().cells[*cell_idx as usize].cpus[new_cpu / 8] |= 1 << new_cpu % 8;
+                self.skel.maps.bss_data.cells[*cell_idx as usize].cpus[new_cpu / 8] |= 1 << new_cpu % 8;
             }
         }
-        for (cell_idx, cell) in self.skel.bss().cells.iter().enumerate() {
+        for (cell_idx, cell) in self.skel.maps.bss_data.cells.iter().enumerate() {
             trace!("Cell {} Cpumask {:X?}", cell_idx, cell.cpus);
         }
         Ok(())
@@ -737,8 +740,8 @@ impl<'a> Scheduler<'a> {
         cell1.cgroups.append(&mut cell2.cgroups);
         // XXX: I don't love manipulating the CPU mask here and not in assign_cpus
         for cpu in cell2.cpu_assignment.iter_ones() {
-            self.skel.bss_mut().cells[merge.cell1 as usize].cpus[cpu / 8] |= 1 << cpu % 8;
-            self.skel.bss_mut().cells[merge.cell2 as usize].cpus[cpu / 8] &= !(1 << cpu % 8);
+            self.skel.maps.bss_data.cells[merge.cell1 as usize].cpus[cpu / 8] |= 1 << cpu % 8;
+            self.skel.maps.bss_data.cells[merge.cell2 as usize].cpus[cpu / 8] &= !(1 << cpu % 8);
         }
         cell1.cpu_assignment |= cell2.cpu_assignment;
         cell1.load += cell2.load;
@@ -826,8 +829,9 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
+    let mut open_object = MaybeUninit::uninit();
     loop {
-        let mut sched = Scheduler::init(&opts)?;
+        let mut sched = Scheduler::init(&opts, &mut open_object)?;
         if !sched.run(shutdown.clone())?.should_restart() {
             break;
         }
